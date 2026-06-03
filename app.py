@@ -5,7 +5,9 @@ import random
 import re
 import secrets
 import sys
+import threading
 import time
+import webbrowser
 from pathlib import Path
 from urllib.parse import quote
 
@@ -39,6 +41,23 @@ MAX_HISTORY = 20
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+
+def is_frozen_app():
+    return bool(getattr(sys, "frozen", False))
+
+
+def should_open_browser():
+    default_value = "1" if is_frozen_app() else "0"
+    value = os.environ.get("OPEN_BROWSER", default_value).lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def open_browser_later(port):
+    if not should_open_browser():
+        return
+    url = f"http://127.0.0.1:{port}"
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
 
 def json_error(message, status_code=400, **extra):
@@ -767,4 +786,5 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5123"))
     debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
+    open_browser_later(port)
     app.run(debug=debug, host=host, port=port)
