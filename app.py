@@ -1,778 +1,766 @@
-from flask import Flask, request, jsonify, render_template_string, session
-import requests
-import json
-import time
-import random
-import string
 import base64
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_v1_5
+import json
+import os
+import random
+import re
 import secrets
+import time
+from pathlib import Path
 from urllib.parse import quote
-import uuid
 
-app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)  # Random secret key for session management
+import requests
+from Crypto.Cipher import PKCS1_v1_5
+from Crypto.PublicKey import RSA
+from flask import Flask, jsonify, render_template_string, request, session
 
-DEFAULT_APPID = "2f8af12ad9912d306b5053abf90c7ebbb695887bc870ae0706d573c348539c26c5c0a878641fcc0d3e90acb9be1e6ef858a59af546f3c826988332376b7d18c8ea2398ee3a9c3db947e2471d32a49612"
 
-# ================= RSA 加密 =================
+DEFAULT_APPID = (
+    "2f8af12ad9912d306b5053abf90c7ebbb695887bc"
+    "870ae0706d573c348539c26c5c0a878641fcc0d3e90acb9be1e6ef858a"
+    "59af546f3c826988332376b7d18c8ea2398ee3a9c3db947e2471d32a49612"
+)
 
-class Encrypt:
-    def __init__(self):
-        self.public_key = """-----BEGIN PUBLIC KEY-----
+PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDc+CZK9bBA9IU+gZUOc6FUGu7y
 O9WpTNB0PzmgFBh96Mg1WrovD1oqZ+eIF4LjvxKXGOdI79JRdve9NPhQo07+uqGQ
 gE4imwNnRx7PFtCRryiIEcUoavuNtuRVoBAm6qdB0SrctgaqGfLgKvZHOnwTjyNq
 jBUxzMeQlEC2czEMSwIDAQAB
 -----END PUBLIC KEY-----"""
 
-    def rsa(self, data):
-        try:
-            if not data:
-                return ""
-            
-            # Load the public key
-            rsa_key = RSA.import_key(self.public_key)
-            cipher = PKCS1_v1_5.new(rsa_key)
-            
-            # Encrypt data in chunks (max 117 bytes for 1024-bit key)
-            chunk_size = 117
-            encrypted_chunks = []
-            
-            # Convert data to bytes if it's a string
-            if isinstance(data, str):
-                data = data.encode('utf-8')
-            
-            for i in range(0, len(data), chunk_size):
-                chunk = data[i:i+chunk_size]
-                encrypted_chunk = cipher.encrypt(chunk)
-                encrypted_chunks.append(encrypted_chunk)
-            
-            # Combine all encrypted chunks and encode as base64
-            encrypted_data = b''.join(encrypted_chunks)
-            return base64.b64encode(encrypted_data).decode('utf-8')
-        
-        except Exception as e:
-            print(f"RSA encryption error: {e}")
-            return ""
+CAPTCHA_APPID = "195809716"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+HISTORY_FILE = DATA_DIR / "token_history.json"
+MAX_HISTORY = 20
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
 
 
-# ================= 核心登录类 =================
+def json_error(message, status_code=400, **extra):
+    payload = {"status": "fail", "msg": message}
+    payload.update(extra)
+    return jsonify(payload), status_code
+
+
+def read_history():
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def write_history(items):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with HISTORY_FILE.open("w", encoding="utf-8") as f:
+        json.dump(items[:MAX_HISTORY], f, ensure_ascii=False, indent=2)
+
+
+def append_history(item):
+    items = read_history()
+    items = [entry for entry in items if entry.get("phone") != item.get("phone")]
+    items.insert(0, item)
+    write_history(items)
+
+
+def clear_history():
+    try:
+        if HISTORY_FILE.exists():
+            HISTORY_FILE.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def normalize_phone(value):
+    phone = re.sub(r"\D", "", str(value or ""))
+    return phone if len(phone) == 11 else ""
+
+
+def random_hex(length=32):
+    return "".join(random.choices("0123456789abcdef", k=length))
+
+
+def generate_appid():
+    def rnd():
+        return str(random.randint(0, 9))
+
+    return (
+        f"{rnd()}f{rnd()}af"
+        f"{rnd()}{rnd()}ad"
+        f"{rnd()}912d306b5053abf90c7ebbb695887bc"
+        "870ae0706d573c348539c26c5c0a878641fcc0d3e90acb9be1e6ef858a"
+        "59af546f3c826988332376b7d18c8ea2398ee3a9c3db947e2471d32a49612"
+    )
+
+
+def session_state():
+    if "device_id" not in session:
+        session["device_id"] = random_hex(32)
+    if "appid" not in session:
+        session["appid"] = generate_appid()
+    return session["device_id"], session["appid"]
+
 
 class UnicomAndroid:
-    def __init__(self, phone, appid, default_appid, device_id=""):
+    def __init__(self, phone, appid=None, device_id=None):
         self.phone = phone
-        self.encrypt = Encrypt()
-        self.device_id = device_id if device_id else self._generate_device_id()
-        
-        # Use provided appid if valid, otherwise use default
-        self.appid = appid if appid and len(appid) > 20 else default_appid
-        
+        self.device_id = device_id or random_hex(32)
+        self.appid = appid if appid and len(appid) > 20 else DEFAULT_APPID
         self.ua = (
             "Mozilla/5.0 (Linux; Android 13; M2007J3SC Build/TKQ1.220829.002; wv) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/107.0.5304.141 Mobile Safari/537.36; "
-            f"unicom{{version:android@11.0800,desmobile:{phone}}};"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/107.0.5304.141 "
+            f"Mobile Safari/537.36; unicom{{version:android@11.0800,desmobile:{phone}}};"
             "devicetype{deviceBrand:Xiaomi,deviceModel:M2007J3SC};{yw_code:}"
         )
 
-    def _generate_device_id(self):
-        """Generate a 32-character hex device ID"""
-        return ''.join(random.choices('0123456789abcdef', k=32))
+    def rsa(self, value):
+        key = RSA.import_key(PUBLIC_KEY.encode("utf-8"))
+        cipher = PKCS1_v1_5.new(key)
+        encrypted = cipher.encrypt(str(value).encode("utf-8"))
+        return base64.b64encode(encrypted).decode("utf-8")
 
-    def _post(self, url, data):
-        """Send POST request with proper headers"""
+    def post_form(self, url, data):
+        headers = {
+            "Host": "m.client.10010.com",
+            "User-Agent": self.ua,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "com.sinovatech.unicom.ui",
+        }
         try:
-            headers = {
-                "Host": "m.client.10010.com",
-                "User-Agent": self.ua,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-Requested-With": "com.sinovatech.unicom.ui"
-            }
-            
-            response = requests.post(url, data=data, headers=headers, timeout=15)
-            
+            response = requests.post(url, data=data, headers=headers, timeout=18)
             try:
-                json_response = response.json()
-                return json_response
+                return response.json()
             except ValueError:
-                return {"code": "Err", "msg": "HTML 响应(IP 可能被风控)"}
-                
-        except requests.exceptions.RequestException as e:
-            return {"code": "Err", "msg": f"请求异常: {str(e)}"}
-        except Exception as e:
-            return {"code": "Err", "msg": "请求异常"}
+                return {
+                    "code": "Err",
+                    "msg": f"上游接口返回非 JSON，HTTP {response.status_code}，可能被风控或网络拦截",
+                }
+        except requests.RequestException as exc:
+            return {"code": "Err", "msg": f"请求上游接口失败：{exc}"}
 
-    def _post_json(self, url, data, extra_headers=None):
-        """Send POST request with JSON data"""
+    def post_json(self, url, data, headers=None):
+        final_headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "com.sinovatech.unicom.ui",
+        }
+        if headers:
+            final_headers.update(headers)
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "X-Requested-With": "com.sinovatech.unicom.ui"
-            }
-            
-            if extra_headers:
-                headers.update(extra_headers)
-            
-            response = requests.post(url, json=data, headers=headers, timeout=15)
-            
+            response = requests.post(url, json=data, headers=final_headers, timeout=18)
             try:
-                json_response = response.json()
-                return json_response
+                return response.json()
             except ValueError:
-                return {"code": "Err", "msg": "HTML 响应(IP 可能被风控)"}
-                
-        except requests.exceptions.RequestException as e:
-            return {"code": "Err", "msg": f"请求异常: {str(e)}"}
-        except Exception as e:
-            return {"code": "Err", "msg": "请求异常"}
+                return {
+                    "code": "Err",
+                    "msg": f"上游接口返回非 JSON，HTTP {response.status_code}，可能被风控或网络拦截",
+                }
+        except requests.RequestException as exc:
+            return {"code": "Err", "msg": f"请求上游接口失败：{exc}"}
 
-    def login(self, code):
-        """Perform login with phone and code"""
-        url = "https://m.client.10010.com/mobileService/radomLogin.htm"
+    def send_code(self, result_token=""):
+        url = "https://m.client.10010.com/mobileService/sendRadomNum.htm"
         timestamp = time.strftime("%Y%m%d%H%M%S")
-
-        mobile = quote(self.encrypt.rsa(self.phone))
-        pwd = quote(self.encrypt.rsa(code))
-
         post_data = (
-            f"isFirstInstall=1"
-            f"&simCount=1"
-            f"&yw_code="
-            f"&loginStyle=0"
-            f"&isRemberPwd=true"
-            f"&deviceOS=android13"
-            f"&mobile={mobile}"
-            f"&netWay=Wifi"
-            f"&version=android@11.0800"
+            "isFirstInstall=1"
+            "&simCount=1"
+            "&yw_code="
+            "&deviceOS=android13"
+            f"&mobile={quote(self.rsa(self.phone))}"
+            "&netWay=Wifi"
+            "&loginCodeLen=6"
             f"&deviceId={self.device_id}"
-            f"&password={pwd}"
-            f"&keyVersion="
-            f"&provinceChanel=general"
+            f"&deviceCode={self.device_id}"
+            "&version=android@11.0800"
+            "&send_flag="
+            f"&resultToken={quote(result_token) if result_token else ''}"
+            "&keyVersion="
+            "&provinceChanel=general"
             f"&appId={self.appid}"
-            f"&deviceModel=M2007J3SC"
+            "&deviceModel=M2007J3SC"
             f"&androidId={self.device_id[:16]}"
-            f"&deviceBrand=Xiaomi"
+            "&deviceBrand=Xiaomi"
             f"&timestamp={timestamp}"
         )
+        return self.post_form(url, post_data)
 
-        res = self._post(url, post_data)
-
-        if "code" in res and str(res["code"]) in ["0", "0000"]:
-            full_result = f"{self.phone}#{code}#{res.get('token_online', '')}#{res.get('ecs_token', '')}#{self.appid}"
-            return {
-                "status": "success",
-                "full": full_result
-            }
-
-        return {
-            "status": "fail",
-            "msg": f"登录失败: {res.get('desc', '未知错误')} [Code:{res.get('code', '')}]"
-        }
-
-    def validate_tencent_captcha(self, mobile_hex, ticket, rand_str):
-        """Validate Tencent CAPTCHA"""
+    def validate_captcha(self, mobile_hex, ticket, rand_str):
         url = "https://loginxhm.10010.com/login-web/v1/chartCaptcha/validateTencentCaptcha"
         payload = {
-            "seq": ''.join(random.choices('0123456789abcdef', k=32)),
+            "seq": random_hex(32),
             "captchaType": "10",
             "mobile": mobile_hex,
             "ticket": ticket,
             "randStr": rand_str,
-            "imei": self.device_id
+            "imei": self.device_id,
         }
-
-        headers = [
-            "Origin: https://img.client.10010.com",
-            "Referer: https://img.client.10010.com/loginRisk/index.html"
-        ]
-
-        # Format headers properly for the request
-        formatted_headers = {
+        headers = {
             "Origin": "https://img.client.10010.com",
-            "Referer": "https://img.client.10010.com/loginRisk/index.html"
+            "Referer": "https://img.client.10010.com/loginRisk/index.html",
         }
+        return self.post_json(url, payload, headers)
 
-        return self._post_json(url, payload, formatted_headers)
-
-    def send_code(self, result_token=""):
-        """Send SMS verification code"""
-        url = "https://m.client.10010.com/mobileService/sendRadomNum.htm"
+    def login(self, code):
+        url = "https://m.client.10010.com/mobileService/radomLogin.htm"
         timestamp = time.strftime("%Y%m%d%H%M%S")
-
-        mobile = quote(self.encrypt.rsa(self.phone))
-        rt = quote(result_token) if result_token else ""
-
         post_data = (
-            f"isFirstInstall=1"
-            f"&simCount=1"
-            f"&yw_code="
-            f"&deviceOS=android13"
-            f"&mobile={mobile}"
-            f"&netWay=Wifi"
-            f"&loginCodeLen=6"
+            "isFirstInstall=1"
+            "&simCount=1"
+            "&yw_code="
+            "&loginStyle=0"
+            "&isRemberPwd=true"
+            "&deviceOS=android13"
+            f"&mobile={quote(self.rsa(self.phone))}"
+            "&netWay=Wifi"
+            "&version=android@11.0800"
             f"&deviceId={self.device_id}"
-            f"&deviceCode={self.device_id}"
-            f"&version=android@11.0800"
-            f"&send_flag="
-            f"&resultToken={rt}"
-            f"&keyVersion="
-            f"&provinceChanel=general"
+            f"&password={quote(self.rsa(code))}"
+            "&keyVersion="
+            "&provinceChanel=general"
             f"&appId={self.appid}"
-            f"&deviceModel=M2007J3SC"
+            "&deviceModel=M2007J3SC"
             f"&androidId={self.device_id[:16]}"
-            f"&deviceBrand=Xiaomi"
+            "&deviceBrand=Xiaomi"
             f"&timestamp={timestamp}"
         )
-
-        res = self._post(url, post_data)
-
-        # Check for success status
-        ok = False
-        if "code" in res and str(res["code"]) in ["0", "0000"]:
-            ok = True
-        if "rsp_code" in res and str(res["rsp_code"]) == "0000":
-            ok = True
-        if "status" in res and str(res["status"]) == "success":
-            ok = True
-
-        if ok:
-            return {"status": "success", "msg": "验证码已发送", "data": res}
-
-        msg = res.get("msg", res.get("desc", res.get("rsp_desc", "发送失败")))
-        return {"status": "fail", "msg": f"发送失败: {msg}", "data": res}
+        return self.post_form(url, post_data)
 
 
-# ================= 登录接口 =================
-
-@app.route('/')
-def index():
-    """Serve the main HTML page"""
-    html_template = '''
-<!DOCTYPE html>
-<html>
+PAGE = r"""
+<!doctype html>
+<html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>联通 Token 在线获取助手(短信版)</title>
-<script src="https://turing.captcha.qcloud.com/TJCaptcha.js"></script>
-
-<style>
-body{font-family:'Segoe UI',Roboto,sans-serif;background:#f0f2f5;display:flex;justify-content:center;padding-top:30px}
-.box{background:#fff;padding:25px;border-radius:12px;width:100%;max-width:420px;box-shadow:0 6px 20px rgba(0,0,0,0.08)}
-h3{text-align:center;color:#333;margin-bottom:20px;font-weight:600}
-.tip{font-size:13px;color:#555;background:#f8f9fa;padding:12px;border-radius:6px;border-left:4px solid #007bff;margin-bottom:20px;line-height:1.6}
-.notice{background:#fff7e6;border:1px solid #ffe0b2;border-radius:8px;padding:12px 12px 10px;margin:8px 0 16px}
-.notice-title{font-weight:700;color:#7a4a00;margin-bottom:6px}
-.notice-text{font-size:13px;color:#6b4b16;line-height:1.6}
-input{width:100%;padding:12px;margin-bottom:12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box}
-.ph-wrap{position:relative}
-.ph-suggest{position:absolute;left:0;right:0;top:46px;background:#fff;border:1px solid #ddd;border-radius:6px;box-shadow:0 6px 16px rgba(0,0,0,0.08);z-index:10;display:none;max-height:200px;overflow:auto}
-.ph-item{padding:10px 12px;cursor:pointer;font-size:14px}
-.ph-item:hover{background:#f3f5f7}
-.ph-empty{padding:10px 12px;color:#888;font-size:13px}
-button{width:100%;padding:12px;border:none;border-radius:6px;color:#fff;font-weight:bold;cursor:pointer;margin-bottom:10px;font-size:15px}
-.btn-login{background:#007bff}
-.res-box{display:none;margin-top:15px}
-.res-content{background:#1e1e1e;color:#fff;padding:15px;border-radius:8px;font-size:13px;word-break:break-all;font-family:Consolas}
-.msg-box{text-align:center;font-size:14px;margin-top:10px;padding:10px;border-radius:6px;display:none}
-.msg-err{background:#fee;color:#c00;border:1px solid #fcc}
-.msg-succ{background:#e8f5e9;color:#2e7d32;border:1px solid #c8e6c9}
-.btn-send{background:#28a745}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>运营商登录态获取</title>
+  <script src="https://turing.captcha.qcloud.com/TJCaptcha.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #19202a;
+      --muted: #6b7280;
+      --line: #d8dee8;
+      --paper: #ffffff;
+      --wash: #f5f7fb;
+      --accent: #0a7c66;
+      --accent-dark: #07614f;
+      --warn: #a15c00;
+      --danger: #b42318;
+      --ok: #087443;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
+      color: var(--ink);
+      display: grid;
+      place-items: start center;
+      padding: 28px 14px;
+    }
+    .shell {
+      width: min(480px, 100%);
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 14px 40px rgba(25, 32, 42, .08);
+      overflow: hidden;
+    }
+    .head {
+      padding: 20px 22px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+    .sub {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .body { padding: 18px 22px 22px; }
+    label {
+      display: block;
+      font-size: 13px;
+      color: #374151;
+      margin: 0 0 7px;
+      font-weight: 650;
+    }
+    input {
+      width: 100%;
+      height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 12px;
+      font-size: 16px;
+      color: var(--ink);
+      background: #fff;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(10, 124, 102, .12);
+    }
+    .field { margin-bottom: 14px; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 128px;
+      gap: 10px;
+      align-items: end;
+    }
+    button {
+      height: 44px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 14px;
+      color: white;
+      background: var(--accent);
+      font-weight: 750;
+      font-size: 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover { background: var(--accent-dark); }
+    button:disabled {
+      cursor: wait;
+      opacity: .68;
+    }
+    .secondary { background: #334155; }
+    .secondary:hover { background: #1f2937; }
+    .copy-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .message {
+      display: none;
+      margin: 14px 0 0;
+      padding: 11px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.45;
+      border: 1px solid transparent;
+    }
+    .message.show { display: block; }
+    .message.ok { color: var(--ok); background: #ecfdf3; border-color: #abefc6; }
+    .message.err { color: var(--danger); background: #fef3f2; border-color: #fecdca; }
+    .result {
+      display: none;
+      margin-top: 16px;
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
+    }
+    .result.show { display: block; }
+    .token {
+      padding: 12px;
+      background: #101828;
+      color: #e5edf7;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      word-break: break-all;
+      min-height: 54px;
+    }
+    .kv {
+      margin-top: 10px;
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .footer {
+      padding: 12px 22px;
+      background: var(--wash);
+      border-top: 1px solid var(--line);
+      color: var(--warn);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    @media (max-width: 420px) {
+      .row, .copy-row { grid-template-columns: 1fr; }
+      body { padding: 12px; }
+      .head, .body, .footer { padding-left: 16px; padding-right: 16px; }
+    }
+  </style>
 </head>
 <body>
+  <main class="shell">
+    <section class="head">
+      <h1>运营商登录态获取</h1>
+      <div class="sub">短信验证码登录，成功后复制 token_online#appid 到 chinaUnicomCookie。</div>
+    </section>
+    <section class="body">
+      <div class="field">
+        <label for="phone">手机号</label>
+        <input id="phone" inputmode="numeric" maxlength="11" autocomplete="tel" placeholder="请输入 11 位手机号">
+      </div>
+      <div class="row field">
+        <div>
+          <label for="code">短信验证码</label>
+          <input id="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位验证码">
+        </div>
+        <button id="sendBtn" type="button">发送验证码</button>
+      </div>
+      <button id="loginBtn" type="button" style="width:100%">登录并生成 Token</button>
+      <div id="msg" class="message"></div>
+      <section id="result" class="result">
+        <label>chinaUnicomCookie</label>
+        <div id="simpleToken" class="token"></div>
+        <div class="copy-row">
+          <button id="copySimple" type="button">复制 token_online#appid</button>
+          <button id="copyFull" class="secondary" type="button">复制完整 JSON</button>
+          <button id="clearHistory" class="secondary" type="button">清除记录</button>
+        </div>
+        <div id="details" class="kv"></div>
+      </section>
+    </section>
+    <section class="footer">只建议本地或内网使用。不要把服务暴露到公网，token 相当于登录态。</section>
+  </main>
 
-<div class="box">
-<h3>联通 Token 在线获取助手(魔改版)</h3>
+  <script>
+    const CAPTCHA_APPID = "195809716";
+    const $ = (id) => document.getElementById(id);
+    let lastResult = null;
 
-<div class="notice">
-  <div class="notice-title">公告</div>
-  <div class="notice-text">功能：短信验证码登录，支持腾讯验证码校验、发送验证码与登录。</div>
-  <div class="notice-text">支持本地缓存记住手机号</div>
-  <div class="notice-text">输出格式：手机号#验证码#token_online#ecs_token#appid</div>
-</div>
-
-<div class="ph-wrap">
-  <input type="tel" id="ph" placeholder="手机号" maxlength="11" autocomplete="off">
-  <div id="ph-suggest" class="ph-suggest"></div>
-</div>
-<div style="display:flex;gap:12px;margin-bottom:8px">
-  <label style="font-size:13px"><input type="radio" name="amode" value="random" checked> 随机 appid</label>
-  <label style="font-size:13px"><input type="radio" name="amode" value="custom"> 自定义 appid</label>
-</div>
-<input id="adv" placeholder="自定义 appid（可选）">
-<input type="text" id="cd" placeholder="短信验证码" maxlength="6">
-
-<button class="btn-login" id="lb" onclick="login()">立即登录</button>
-
-<button class="btn-send" id="sb" onclick="sendCode()">发送验证码</button>
-<div id="msg" class="msg-box"></div>
-
-<div id="res" class="res-box">
-<div class="msg-succ">✅ 登录成功</div>
-<div id="res-html" class="res-content"></div>
-<textarea id="res-raw" style="display:none"></textarea>
-<textarea id="res-simple-raw" style="display:none"></textarea>
-
-<button style="background:#28a745;width:100%" onclick="copy()">复制完整数据</button>
-<button style="background:#ff9800;width:100%;margin-top:8px" onclick="copySimple()">复制 token_online#appid</button>
-
-</div>
-
-</div>
-
-<script>
-const CAPTCHA_APPID = "195809716";
-
-const PHONE_HISTORY_KEY = "phone_history";
-const PHONE_HISTORY_MAX = 20;
-
-function normalizePhone(value){
-    return (value || '').replace(/[^0-9]/g, '').slice(0, 11);
-}
-
-function loadPhoneHistory(){
-    try{
-        const raw = localStorage.getItem(PHONE_HISTORY_KEY);
-        const list = raw ? JSON.parse(raw) : [];
-        if(!Array.isArray(list)) return [];
-        return list.filter(v => typeof v === 'string' && v.length > 0);
-    }catch(e){
-        return [];
+    function setBusy(id, busy, text) {
+      const btn = $(id);
+      btn.disabled = busy;
+      if (text) btn.textContent = text;
     }
-}
 
-function savePhoneHistory(phone){
-    try{
-        const p = normalizePhone(phone);
-        if(p.length !== 11) return;
-        let list = loadPhoneHistory();
-        list = [p, ...list.filter(v => v !== p)];
-        if(list.length > PHONE_HISTORY_MAX) list = list.slice(0, PHONE_HISTORY_MAX);
-        localStorage.setItem(PHONE_HISTORY_KEY, JSON.stringify(list));
-    }catch(e){
+    function message(text, type = "err") {
+      const box = $("msg");
+      box.textContent = text || "";
+      box.className = "message show " + (type === "ok" ? "ok" : "err");
+    }
+
+    function cleanPhone() {
+      const phone = $("phone").value.replace(/\D/g, "").slice(0, 11);
+      $("phone").value = phone;
+      return phone;
+    }
+
+    function cleanCode() {
+      const code = $("code").value.replace(/\D/g, "").slice(0, 6);
+      $("code").value = code;
+      return code;
+    }
+
+    async function postJSON(url, payload) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      return response.json();
+    }
+
+    async function sendCode(resultToken = "") {
+      const phone = cleanPhone();
+      if (phone.length !== 11) {
+        message("请输入 11 位手机号");
         return;
+      }
+      setBusy("sendBtn", true, "发送中");
+      try {
+        const data = await postJSON("/api/send", {phone, resultToken});
+        if (data.status === "success") {
+          message(data.msg || "验证码已发送", "ok");
+        } else if (data.status === "need_captcha") {
+          message(data.msg || "需要安全验证");
+          await startCaptcha(phone, data.mobile || "");
+        } else {
+          message(data.msg || "发送失败");
+        }
+      } catch (err) {
+        message("请求失败，请检查服务是否正常运行");
+      } finally {
+        setBusy("sendBtn", false, "发送验证码");
+      }
     }
-}
 
-function renderPhoneSuggest(list){
-    const box = document.getElementById('ph-suggest');
-    if(!box) return;
-    box.innerHTML = '';
-    if(!list.length){
-        const empty = document.createElement('div');
-        empty.className = 'ph-empty';
-        empty.textContent = '无历史记录';
-        box.appendChild(empty);
-        box.style.display = 'block';
+    async function startCaptcha(phone, mobileHex) {
+      if (typeof TencentCaptcha !== "function") {
+        message("腾讯验证码组件加载失败，请刷新页面或检查网络");
         return;
-    }
-    list.forEach(v=>{
-        const item = document.createElement('div');
-        item.className = 'ph-item';
-        item.dataset.value = v;
-        item.textContent = v;
-        box.appendChild(item);
-    });
-    box.style.display = 'block';
-}
-
-function updatePhoneSuggest(keyword){
-    const list = loadPhoneHistory();
-    const key = normalizePhone(keyword);
-    const filtered = key ? list.filter(v => v.includes(key)) : list;
-    renderPhoneSuggest(filtered);
-}
-
-function hidePhoneSuggest(){
-    const box = document.getElementById('ph-suggest');
-    if(!box) return;
-    box.style.display = 'none';
-    box.innerHTML = '';
-}
-
-function initPhoneHistory(){
-    const input = document.getElementById('ph');
-    const box = document.getElementById('ph-suggest');
-    if(!input || !box) return;
-
-    box.addEventListener('mousedown', function(e){
-        const item = e.target.closest('.ph-item');
-        if(item){
-            input.value = item.dataset.value || '';
-            hidePhoneSuggest();
+      }
+      const captcha = new TencentCaptcha(CAPTCHA_APPID, async function(res) {
+        if (res.ret !== 0) {
+          message("已取消安全验证");
+          return;
         }
-    });
-
-    input.addEventListener('input', function(){
-        updatePhoneSuggest(input.value);
-    });
-    input.addEventListener('focus', function(){
-        updatePhoneSuggest(input.value);
-    });
-    input.addEventListener('blur', function(){
-        setTimeout(hidePhoneSuggest, 150);
-    });
-}
-
-function generateAppId(){
-    try{
-        function rnd(){
-            return String(Math.floor(Math.random()*10));
+        try {
+          const validated = await postJSON("/api/validate", {
+            phone,
+            mobile: mobileHex,
+            ticket: res.ticket,
+            randstr: res.randstr
+          });
+          if (validated.status === "success" && validated.resultToken) {
+            await sendCode(validated.resultToken);
+          } else {
+            message(validated.msg || "安全验证失败");
+          }
+        } catch (err) {
+          message("安全验证请求失败");
         }
-        return (
-            rnd() + "f" + rnd() + "af" +
-            rnd() + rnd() + "ad" +
-            rnd() + "912d306b5053abf90c7ebbb695887bc" +
-            "870ae0706d573c348539c26c5c0a878641fcc0d3e90acb9be1e6ef858a" +
-            "59af546f3c826988332376b7d18c8ea2398ee3a9c3db947e2471d32a49612"
-        );
-    }catch(e){
-        return "";
+      });
+      captcha.show();
     }
-}
 
-function getAppIdMode(){
-    let el=document.querySelector('input[name="amode"]:checked');
-    return el ? el.value : 'random';
-}
-function getAppId(){
-    let adv=document.getElementById('adv');
-    if(!adv) return '';
-    let mode=getAppIdMode();
-    if(mode==='random' && !adv.value){
-        adv.value = generateAppId();
-    }
-    return adv.value || '';
-}
-function syncAppIdInput(){
-    let mode=getAppIdMode();
-    let adv=document.getElementById('adv');
-    if(!adv) return;
-    adv.disabled = (mode !== 'custom');
-    if(mode === 'random'){
-        adv.value = generateAppId();
-    }
-}
-function initAppIdMode(){
-    let radios=document.querySelectorAll('input[name="amode"]');
-    radios.forEach(r=>r.addEventListener('change', syncAppIdInput));
-    syncAppIdInput();
-}
-initAppIdMode();
-initPhoneHistory();
-
-async function sendCode(){
-    let p=document.getElementById('ph').value;
-    let appid=getAppId();
-    let msg=document.getElementById('msg');
-    let sb=document.getElementById('sb');
-
-    msg.style.display='none';
-
-    if(!p){
-        showMsg('请填写手机号','err');
+    async function login() {
+      const phone = cleanPhone();
+      const code = cleanCode();
+      if (phone.length !== 11 || code.length < 4) {
+        message("请填写手机号和短信验证码");
         return;
-    }
-
-    savePhoneHistory(p);
-
-    sb.disabled=true;
-    sb.innerText='发送中...';
-
-    try{
-        let r=await fetch('/api/send',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({phone:p,appid:appid,resultToken:''})
-        });
-
-        let d=await r.json();
-
-        if(d.status==='success'){
-            showMsg(d.msg||'验证码已发送','succ');
-        }else if(d.status==='need_captcha'){
-            showMsg(d.msg||'需要安全验证','err');
-            await startCaptcha(p,appid,d.mobile||'');
-        }else{
-            showMsg(d.msg||'发送失败','err');
+      }
+      setBusy("loginBtn", true, "登录中");
+      $("result").classList.remove("show");
+      try {
+        const data = await postJSON("/api/login", {phone, code});
+        if (data.status !== "success") {
+          message(data.msg || "登录失败");
+          return;
         }
-
-    }catch(e){
-        showMsg('网络错误','err');
+        renderResult(data, "本次获取");
+        message("登录成功，已生成 token_online#appid", "ok");
+      } catch (err) {
+        message("请求失败，请检查服务是否正常运行");
+      } finally {
+        setBusy("loginBtn", false, "登录并生成 Token");
+      }
     }
 
-    sb.disabled=false;
-    sb.innerText='发送验证码';
-}
-
-async function startCaptcha(phone, appid, mobileHex){
-    if(typeof TencentCaptcha!=='function'){
-        showMsg('验证码组件未加载','err');
+    async function copyText(text) {
+      if (!text) {
+        message("没有可复制的数据");
         return;
-    }
-
-    let captcha = new TencentCaptcha(CAPTCHA_APPID, async function(res){
-        if(res.ret===0){
-            try{
-                let vr=await fetch('/api/validate',{
-                    method:'POST',
-                    headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({ticket:res.ticket,randstr:res.randstr,mobile:mobileHex,phone:phone,appid:appid})
-                });
-                let vd=await vr.json();
-                if(vd.status==='success' && vd.resultToken){
-                    let sr=await fetch('/api/send',{
-                        method:'POST',
-                        headers:{'Content-Type':'application/json'},
-                        body:JSON.stringify({phone:phone,appid:appid,resultToken:vd.resultToken})
-                    });
-                    let sd=await sr.json();
-                    if(sd.status==='success'){
-                        showMsg(sd.msg||'验证码已发送','succ');
-                    }else{
-                        showMsg(sd.msg||'发送失败','err');
-                    }
-                }else{
-                    showMsg(vd.msg||'安全验证失败','err');
-                }
-            }catch(e){
-                showMsg('网络错误','err');
-            }
-        }else{
-            showMsg('已取消安全验证','err');
+      }
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          message("已复制到剪贴板", "ok");
+          return;
         }
-    });
-    captcha.show();
-}
-
-async function login(){
-    let p=document.getElementById('ph').value;
-    let c=document.getElementById('cd').value;
-    let appid=getAppId();
-    let msg=document.getElementById('msg');
-    let resBox=document.getElementById('res');
-    let lb=document.getElementById('lb');
-
-    msg.style.display='none';
-    resBox.style.display='none';
-
-    if(!p||!c){
-        showMsg('请填写手机号和验证码','err');
-        return;
+      } catch (err) {
+        // Fall back below.
+      }
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.left = "-9999px";
+      area.style.top = "0";
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      area.setSelectionRange(0, area.value.length);
+      const ok = document.execCommand("copy");
+      document.body.removeChild(area);
+      message(ok ? "已复制到剪贴板" : "复制失败，请手动选中复制", ok ? "ok" : "err");
     }
 
-    savePhoneHistory(p);
+    function renderResult(data, label) {
+      lastResult = data;
+      $("simpleToken").textContent = data.simple || data.chinaUnicomCookie || "";
+      const created = data.created_at ? new Date(data.created_at * 1000).toLocaleString() : "";
+      $("details").innerHTML = `
+        <div>来源：${label || "历史记录"}</div>
+        <div>手机号：${data.phone || ""}</div>
+        <div>保存时间：${created || "刚刚"}</div>
+        <div>token_online 长度：${(data.token_online || "").length}</div>
+        <div>ecs_token 长度：${(data.ecs_token || "").length}</div>
+        <div>appid 长度：${(data.appid || "").length}</div>
+      `;
+      $("result").classList.add("show");
+    }
 
-    lb.disabled=true;
-    lb.innerText='正在登录...';
-
-    try{
-        let r=await fetch('/api/login',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({phone:p,code:c,appid:appid})
-        });
-
-        let d=await r.json();
-
-        if(d.status==='success'){
-
-            document.getElementById('res-html').innerText = d.full;
-            document.getElementById('res-raw').value = d.full;
-
-            // 自动切割生成 token_online#appid
-            try{
-                let parts = d.full.split('#');
-
-                if(parts.length >= 5){
-                    let simple = parts[2] + "#" + parts[4];
-                    document.getElementById('res-simple-raw').value = simple;
-                }else{
-                    document.getElementById('res-simple-raw').value = "";
-                }
-
-            }catch(e){
-                document.getElementById('res-simple-raw').value = "";
-            }
-
-            resBox.style.display='block';
+    async function loadHistory() {
+      try {
+        const response = await fetch("/api/history");
+        const data = await response.json();
+        if (data.status === "success" && data.latest) {
+          renderResult(data.latest, "上次获取");
+          message("已加载上次获取记录", "ok");
         }
-        else{
-            showMsg(d.msg,'err');
+      } catch (err) {
+        // History is optional.
+      }
+    }
+
+    async function clearSavedHistory() {
+      try {
+        const data = await postJSON("/api/clear", {});
+        if (data.status === "success") {
+          lastResult = null;
+          $("simpleToken").textContent = "";
+          $("details").innerHTML = "";
+          $("result").classList.remove("show");
+          message("本机保存记录已清除", "ok");
+        } else {
+          message(data.msg || "清除失败");
         }
-
-    }catch(e){
-        showMsg('网络错误','err');
+      } catch (err) {
+        message("清除失败，请检查服务是否正常运行");
+      }
     }
 
-    lb.disabled=false;
-    lb.innerText='立即登录';
-}
-
-function showMsg(t,type){
-    let m=document.getElementById('msg');
-    m.innerText=t;
-    m.className='msg-box '+(type==='err'?'msg-err':'msg-succ');
-    m.style.display='block';
-}
-
-function copy(){
-    let t=document.getElementById('res-raw');
-    t.style.display='block';
-    t.select();
-    document.execCommand('copy');
-    t.style.display='none';
-    alert('已复制到剪贴板');
-}
-function copySimple(){
-    let t=document.getElementById('res-simple-raw');
-
-    if(!t.value){
-        alert('数据格式异常');
-        return;
-    }
-
-    t.style.display='block';
-    t.select();
-    document.execCommand('copy');
-    t.style.display='none';
-    alert('已复制 token_online#appid');
-}
-
-</script>
-
+    $("phone").addEventListener("input", cleanPhone);
+    $("code").addEventListener("input", cleanCode);
+    $("sendBtn").addEventListener("click", () => sendCode(""));
+    $("loginBtn").addEventListener("click", login);
+    $("copySimple").addEventListener("click", () => copyText(lastResult && (lastResult.simple || lastResult.chinaUnicomCookie)));
+    $("copyFull").addEventListener("click", () => copyText(JSON.stringify(lastResult, null, 2)));
+    $("clearHistory").addEventListener("click", clearSavedHistory);
+    loadHistory();
+  </script>
 </body>
 </html>
-'''
-    return render_template_string(html_template)
+"""
 
 
-@app.route('/api/send', methods=['POST'])
+@app.route("/")
+def index():
+    return render_template_string(PAGE)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.route("/api/history", methods=["GET"])
+def history():
+    items = read_history()
+    latest = items[0] if items else None
+    return jsonify({"status": "success", "latest": latest, "items": items})
+
+
+@app.route("/api/clear", methods=["POST"])
+def clear_saved_history():
+    ok = clear_history()
+    return jsonify({"status": "success" if ok else "fail", "msg": "已清除" if ok else "清除失败"})
+
+
+@app.route("/api/send", methods=["POST"])
 def send_code():
-    """Handle SMS code sending"""
-    try:
-        data = request.get_json()
-        
-        phone = data.get("phone", "")
-        appid = data.get("appid", "")
-        result_token = data.get("resultToken", "")
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone"))
+    result_token = str(data.get("resultToken") or "")
+    if not phone:
+        return json_error("手机号格式不正确")
 
-        if not phone:
-            return jsonify({"status": "fail", "msg": "手机号不能为空"})
-        
-        if not appid:
-            return jsonify({"status": "fail", "msg": "appid 不能为空"})
+    device_id, appid = session_state()
+    client = UnicomAndroid(phone, appid, device_id)
+    upstream = client.send_code(result_token)
 
-        # Get or generate device ID from session
-        device_id = session.get("deviceId", "")
-        if not device_id:
-            device_id = ''.join(random.choices('0123456789abcdef', k=32))
-            session["deviceId"] = device_id
+    code = str(upstream.get("code", "") or upstream.get("rsp_code", ""))
+    desc = upstream.get("dsc") or upstream.get("msg") or upstream.get("desc") or upstream.get("rsp_desc") or ""
 
-        u = UnicomAndroid(phone, appid, DEFAULT_APPID, device_id)
-        res = u.send_code(result_token)
+    ok = code in {"0", "0000"} or str(upstream.get("status", "")) == "success"
+    if ok:
+        return jsonify({"status": "success", "msg": "验证码已发送"})
 
-        code = res["data"].get("code", "") if "data" in res else ""
-        dsc = res["data"].get("dsc", res["data"].get("rsp_desc", "") if "data" in res else "")
-        
-        need_captcha = False
-        if code in ["ECS99998", "ECS99999"]:
-            need_captcha = True
-        if "ECS1164" in dsc:
-            need_captcha = True
+    need_captcha = code in {"ECS99998", "ECS99999"} or "ECS1164" in str(desc)
+    if need_captcha:
+        mobile_hex = upstream.get("mobile", "")
+        if mobile_hex:
+            session["mobile_hex"] = mobile_hex
+        return jsonify({
+            "status": "need_captcha",
+            "msg": desc or "需要安全验证",
+            "mobile": mobile_hex,
+            "url": upstream.get("url", ""),
+        })
 
-        if need_captcha:
-            if "mobile" in res["data"]:
-                session["mobileHex"] = res["data"]["mobile"]
-            return jsonify({
-                "status": "need_captcha",
-                "msg": dsc or "需要安全验证",
-                "mobile": res["data"].get("mobile", ""),
-                "url": res["data"].get("url", "")
-            })
-
-        return jsonify(res)
-
-    except Exception as e:
-        return jsonify({"status": "fail", "msg": "服务端内部错误"})
+    return jsonify({
+        "status": "fail",
+        "msg": desc or "验证码发送失败",
+        "code": code,
+    })
 
 
-@app.route('/api/validate', methods=['POST'])
+@app.route("/api/validate", methods=["POST"])
 def validate_captcha():
-    """Handle Tencent CAPTCHA validation"""
-    try:
-        data = request.get_json()
-        
-        ticket = data.get("ticket", "")
-        randstr = data.get("randstr", "")
-        mobile_hex = data.get("mobile", "")
-        phone = data.get("phone", "")
-        appid = data.get("appid", "")
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone"))
+    ticket = str(data.get("ticket") or "")
+    rand_str = str(data.get("randstr") or "")
+    mobile_hex = str(data.get("mobile") or session.get("mobile_hex") or "")
 
-        if not ticket or not randstr:
-            return jsonify({"status": "fail", "msg": "ticket/randstr 不能为空"})
+    if not phone:
+        return json_error("手机号格式不正确")
+    if not ticket or not rand_str:
+        return json_error("缺少腾讯验证码参数")
+    if not mobile_hex:
+        return json_error("缺少上游风控 mobile 参数，请重新发送验证码")
 
-        if not mobile_hex and "mobileHex" in session:
-            mobile_hex = session["mobileHex"]
+    device_id, appid = session_state()
+    client = UnicomAndroid(phone, appid, device_id)
+    upstream = client.validate_captcha(mobile_hex, ticket, rand_str)
 
-        if not mobile_hex:
-            return jsonify({"status": "fail", "msg": "mobile 不能为空"})
+    if str(upstream.get("code", "")) == "0000":
+        result_token = (upstream.get("data") or {}).get("resultToken", "")
+        if result_token:
+            session["result_token"] = result_token
+            return jsonify({"status": "success", "resultToken": result_token})
 
-        # Get or generate device ID from session
-        device_id = session.get("deviceId", "")
-        if not device_id:
-            device_id = ''.join(random.choices('0123456789abcdef', k=32))
-            session["deviceId"] = device_id
-
-        if not appid:
-            return jsonify({"status": "fail", "msg": "appid 不能为空"})
-
-        u = UnicomAndroid(phone, appid, DEFAULT_APPID, device_id)
-        res = u.validate_tencent_captcha(mobile_hex, ticket, randstr)
-
-        if "code" in res and str(res["code"]) == "0000":
-            token = res.get("data", {}).get("resultToken", "")
-            if token:
-                session["resultToken"] = token
-            return jsonify({
-                "status": "success",
-                "resultToken": token,
-                "data": res
-            })
-
-        msg = res.get("msg", res.get("dsc", res.get("desc", "校验失败")))
-        return jsonify({"status": "fail", "msg": msg, "data": res})
-
-    except Exception as e:
-        return jsonify({"status": "fail", "msg": "服务端内部错误"})
+    msg = upstream.get("msg") or upstream.get("dsc") or upstream.get("desc") or "安全验证失败"
+    return jsonify({"status": "fail", "msg": msg})
 
 
-@app.route('/api/login', methods=['POST'])
+@app.route("/api/login", methods=["POST"])
 def login():
-    """Handle login with phone and code"""
-    try:
-        data = request.get_json()
-        
-        phone = data.get("phone", "")
-        code = data.get("code", "")
-        appid = data.get("appid", "")
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone"))
+    code = re.sub(r"\D", "", str(data.get("code") or ""))
+    if not phone:
+        return json_error("手机号格式不正确")
+    if len(code) < 4:
+        return json_error("短信验证码格式不正确")
 
-        if not phone or not code:
-            return jsonify({"status": "fail", "msg": "手机号和验证码不能为空"})
-        
-        if not appid:
-            return jsonify({"status": "fail", "msg": "appid 不能为空"})
+    device_id, appid = session_state()
+    client = UnicomAndroid(phone, appid, device_id)
+    upstream = client.login(code)
 
-        u = UnicomAndroid(phone, appid, DEFAULT_APPID)
-        result = u.login(code)
-        
+    result_code = str(upstream.get("code", ""))
+    if result_code in {"0", "0000"}:
+        token_online = upstream.get("token_online", "")
+        ecs_token = upstream.get("ecs_token", "")
+        if not token_online:
+            return jsonify({"status": "fail", "msg": "登录成功但响应缺少 token_online"})
+        simple = f"{token_online}#{appid}"
+        result = {
+            "status": "success",
+            "phone": phone,
+            "token_online": token_online,
+            "ecs_token": ecs_token,
+            "appid": appid,
+            "simple": simple,
+            "chinaUnicomCookie": simple,
+            "created_at": int(time.time()),
+        }
+        append_history(result)
         return jsonify(result)
 
-    except Exception as e:
-        return jsonify({"status": "fail", "msg": "服务端内部错误"})
+    msg = upstream.get("desc") or upstream.get("msg") or upstream.get("dsc") or "登录失败"
+    return jsonify({"status": "fail", "msg": f"{msg} [Code:{result_code}]"})
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5123"))
+    debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
+    app.run(debug=debug, host=host, port=port)
