@@ -259,7 +259,7 @@ PAGE = r"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>运营商登录态获取</title>
+  <title>登录验证码获取工具</title>
   <script src="https://turing.captcha.qcloud.com/TJCaptcha.js"></script>
   <style>
     :root {
@@ -420,7 +420,7 @@ PAGE = r"""
 <body>
   <main class="shell">
     <section class="head">
-      <h1>运营商登录态获取</h1>
+      <h1>登录验证码获取工具</h1>
       <div class="sub">短信验证码登录，成功后复制 token_online#appid 到 chinaUnicomCookie。</div>
     </section>
     <section class="body">
