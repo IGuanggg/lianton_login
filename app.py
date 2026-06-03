@@ -4,6 +4,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -28,7 +29,10 @@ jBUxzMeQlEC2czEMSwIDAQAB
 -----END PUBLIC KEY-----"""
 
 CAPTCHA_APPID = "195809716"
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 HISTORY_FILE = DATA_DIR / "token_history.json"
 MAX_HISTORY = 20
