@@ -15,6 +15,15 @@ Open:
 http://127.0.0.1:5123
 ```
 
+## Desktop Window
+
+```bash
+pip install -r requirements.txt pywebview
+python desktop.py
+```
+
+The desktop entry opens the page inside its own local window.
+
 ## Docker
 
 ```bash
